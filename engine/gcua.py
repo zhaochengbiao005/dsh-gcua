@@ -296,6 +296,9 @@ todo.update(id="s1", status="claimed_verified")
 '''
         GDIR.mkdir(parents=True, exist_ok=True)
         p = _spawn(demo, timeout=120)
+        if p.returncode != 0 or not p.stdout.strip():
+            raise RuntimeError(f"worker boot failed: rc={p.returncode} "
+                               f"stdout={p.stdout[:300]!r} stderr={p.stderr[-800:]!r}")
         r = json.loads(p.stdout.strip())
         assert r["ok"], r
         assert "hello 2" in r["stdout"] and "claimed_verified" in r["ledger"], r
