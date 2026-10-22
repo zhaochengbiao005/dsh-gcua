@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "GCUA Agent Machine",
+    "description": "Generalist Computer-Use Agent runtime: sandboxed Python step execution with a model-driven todo ledger, verify state machine, and stall guard. Steps run real GUI automation in the session working directory."
+  }
+}

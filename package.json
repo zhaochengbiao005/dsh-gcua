@@ -1,0 +1,18 @@
+{
+  "name": "@local/gcua",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GCUA agent state machine: sandboxed step execution, todo ledger, stall guard",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "cordis.patch.yml", "engine/gcua.py", "locale/*.json", "icon.svg"],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
