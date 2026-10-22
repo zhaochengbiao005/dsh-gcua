@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install GUI lane deps
+        run: pip install mss pyautogui pywinauto
+
+      - name: Syntax check (node)
+        shell: bash
+        run: node --check index.js
+
+      - name: Engine selftest (ledger, stall, phases, busy lock, corruption heal)
+        shell: bash
+        run: python engine/gcua.py selftest
