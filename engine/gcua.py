@@ -198,12 +198,16 @@ def worker(code: str) -> dict:
 
     import pyautogui  # present on this machine; worker fails loud if GUI session missing
     pyautogui.FAILSAFE = True  # corner-abort retained: physical escape hatch
+    try:
+        _ig = __import__("PIL.ImageGrab", fromlist=["ImageGrab"])  # pillow optional: headless runners lack it
+    except ImportError:
+        _ig = None
     ns: dict = {
         "print": lambda *a, **k: print(*a, file=buf_out, **k),
         "time": time, "os": os, "json": json, "re": re, "Path": Path,
         "subprocess": subprocess,
         "todo": todo, "phase": phase, "screenshot": screenshot, "ps": ps, "paste_text": paste_text,
-        "pyautogui": pyautogui, "ImageGrab": __import__("PIL.ImageGrab", fromlist=["ImageGrab"]),
+        "pyautogui": pyautogui, "ImageGrab": _ig,
     }
     try:
         try:
