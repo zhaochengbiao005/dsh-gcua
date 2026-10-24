@@ -3,3 +3,4 @@ __pycache__/
 .gcua/
 .selftest/
 node_modules/
+*.lock

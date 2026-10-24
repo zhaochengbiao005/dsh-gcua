@@ -4,13 +4,15 @@
 """Usage:
   python gcua.py step code.py     # execute one <code> step in an isolated worker
   python gcua.py status           # todo ledger + stall history
-  python gcua.py reset            # wipe state
+  python gcua.py reset            # wipe state + step scripts (screenshots kept for audit)
   python gcua.py selftest         # smoke-check all pieces
 State: ./.gcua/state.json, screenshots: ./.gcua/shot-NNN.png
 """
 from __future__ import annotations
-import atexit, hashlib, io, json, os, re, subprocess, sys, time
+import atexit, base64, ctypes, hashlib, io, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
+
+RESULT_SENTINEL = "__GCUA_RESULT__"  # stdout protocol marker: model code writing raw fd-1 bytes can't break the JSON line
 
 ROOT = Path(os.environ.get("GCUA_ROOT") or Path(__file__).parent)
 GDIR = ROOT / ".gcua"
@@ -68,9 +70,15 @@ class Stall:
         self.warn, self.stop, self.window = warn, stop, window
 
     @staticmethod
-    def fingerprint(code: str, rc: int, stderr_tail: str) -> str:
+    def fingerprint(code: str, rc: int, stderr_tail: str, stdout_tail: str = "") -> str:
+        # rc!=0: same code + same failure = no progress (upstream rule).
+        # rc==0: fold an stdout digest in, so a *changing* result is progress even for identical code;
+        # identical successful output still accumulates (true spin) - but worker() keeps ok/exit truthful.
         norm = "\n".join(l.rstrip() for l in code.strip().splitlines() if l.strip())
-        outcome = f"rc={rc}|{stderr_tail.strip().splitlines()[-1][:200]}" if rc else ""
+        if rc:
+            outcome = f"rc={rc}|{stderr_tail.strip().splitlines()[-1][:200]}"
+        else:
+            outcome = "out=" + hashlib.sha1(stdout_tail.encode("utf-8", "replace")).hexdigest()[:16]
         return hashlib.sha1((norm + "\x00" + outcome).encode("utf-8", "replace")).hexdigest()
 
     def record(self, hist: list[str], fp: str) -> str | None:
@@ -115,9 +123,26 @@ def _save(s: dict) -> None:
     os.replace(tmp, STATE)  # atomic: a crash can never leave a half-written state.json
 
 
+def _pid_alive(pid: int) -> bool:
+    # a lock is only stealable when BOTH its age exceeded STALE_S AND its owner pid is dead:
+    # a legit long GUI step (up to 6min) must never have its state stolen out from under it
+    if pid <= 0:
+        return False
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if h:
+            k32.CloseHandle(h)
+            return True
+        return False
+    except Exception:  # non-Windows / weird: assume alive, never steal on a guess
+        return True
+
+
 def _acquire_lock(deadline_s: float = 10.0):
     """Single control session per working dir (upstream Authority/RESOURCE_BUSY analog):
-    waits up to deadline_s, takes over a stale lock (>5min, crashed worker).
+    waits up to deadline_s, takes over only a stale lock (age > STALE_S 420s AND owner pid dead).
+    STALE_S > every step timeout (engine 300s, host 360s): a slow-but-alive step is never declared dead.
     Ledger stays shared on purpose: one task board per dir."""
     GDIR.mkdir(parents=True, exist_ok=True)
     lock = GDIR / "state.lock"
@@ -130,9 +155,14 @@ def _acquire_lock(deadline_s: float = 10.0):
             return lock
         except FileExistsError:
             try:
-                if time.time() - lock.stat().st_mtime > 300:
-                    lock.unlink()
-                    continue
+                if time.time() - lock.stat().st_mtime > 420:
+                    try:
+                        dead = not _pid_alive(int(lock.read_text().strip() or "0"))
+                    except (ValueError, OSError):
+                        dead = True
+                    if dead:
+                        lock.unlink()
+                        continue
             except FileNotFoundError:
                 continue
             if time.time() > deadline:
@@ -174,14 +204,20 @@ def worker(code: str) -> dict:
         p = GDIR / f"shot-{n:03d}.png"
         GDIR.mkdir(parents=True, exist_ok=True)
         with mss.mss() as sc:
-            m = sc.grab(sc.monitors[1])
+            mons = sc.monitors
+            # single screen: monitors[1] == the physical display; multi-screen: monitors[0]
+            # is the full virtual-desktop union, matching pyautogui absolute coordinates
+            m = sc.grab(mons[0] if len(mons) > 2 else mons[1])
             mss.tools.to_png(m.rgb, m.size, output=str(p))
         shots.append(str(p))
         return str(p)
 
     def ps(cmd: str, timeout: int = 60) -> dict:
-        r = subprocess.run(["powershell", "-NoProfile", "-Command",
-                            "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + cmd],
+        # -EncodedCommand (base64 UTF-16LE): the command string never passes through
+        # argument-quote parsing, so there is no quoting/escaping/injection surface at all
+        full = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + str(cmd)
+        enc = base64.b64encode(full.encode("utf-16-le")).decode("ascii")
+        r = subprocess.run(["powershell", "-NoProfile", "-EncodedCommand", enc],
                            capture_output=True, text=True, timeout=timeout)
         return {"stdout": r.stdout, "stderr": r.stderr, "rc": r.returncode}
 
@@ -209,12 +245,16 @@ def worker(code: str) -> dict:
         "todo": todo, "phase": phase, "screenshot": screenshot, "ps": ps, "paste_text": paste_text,
         "pyautogui": pyautogui, "ImageGrab": _ig,
     }
+    class _MissingUIA:  # fail loud at first touch, not a silent None with a misleading NoneType error
+        def __getattr__(self, _n):
+            raise ImportError("pywinauto is not installed - run `pip install pywinauto` to use the uia lane")
+
     try:
         try:
             from pywinauto import Desktop as _D  # optional: UIA tree when installed
             ns["uia"] = _D(backend="uia")
         except ImportError:
-            ns["uia"] = None
+            ns["uia"] = _MissingUIA()
         exec(compile(code, "<step>", "exec"), ns)  # ponytail: full-trust exec, same model as OpenGCUA worker
         rc, err = 0, ""
     except Exception as e:
@@ -226,7 +266,7 @@ def worker(code: str) -> dict:
     s["steps"] = s["steps"][-200:]  # ponytail: cap in state; full replay = trajectory files later
     out = buf_out.getvalue()[-4000:]
     errbuf = (err + buf_err.getvalue())[-2000:]
-    fp = Stall.fingerprint(code, rc, errbuf)
+    fp = Stall.fingerprint(code, rc, errbuf, out)
     notice = Stall().record(s.setdefault("stall", []), fp)
     ledger, s["todo_fp"] = todo.render(s.get("todo_fp", ""))
     s["todo"] = todo.items
@@ -254,9 +294,15 @@ def cmd_step(path: str) -> int:
     if p.returncode and not p.stdout.strip():
         print(json.dumps({"ok": False, "error": f"worker died rc={p.returncode}: {p.stderr[-800:]}"}))
         return 1
-    print(p.stdout.strip() or json.dumps({"ok": False, "error": "no worker output"}))
-    r = json.loads(p.stdout.strip())
-    return 0 if r.get("ok") and not (r.get("stall") or "").startswith("STALL STOP") else 1
+    cands = [l for l in p.stdout.splitlines() if l.startswith(RESULT_SENTINEL)]
+    if cands:
+        r = json.loads(cands[-1][len(RESULT_SENTINEL):])
+    else:  # protocol breach (raw fd-1 noise, died mid-emit): report as unparseable WITH the raw bytes
+        print(json.dumps({"ok": False, "error": "unparseable worker output (no result line)",
+                          "raw_stdout": p.stdout[-1500:], "raw_stderr": p.stderr[-800:]}))
+        return 1
+    print(json.dumps(r, ensure_ascii=False))  # re-emit ONE clean JSON line for the host tool
+    return 0 if r.get("ok") else 1  # exit mirrors the step's real outcome; stall notices never flip it
 
 
 def cmd_status() -> int:
@@ -277,9 +323,18 @@ def cmd_reset() -> int:
     if lock is None:
         print("BUSY: a worker holds the lock; reset refused")
         return 1
-    _save({})
-    lock.unlink(missing_ok=True)
+    _save(_empty())  # full empty state (not a bare {}): all keys present for downstream .get()s
+    shutil.rmtree(GDIR / "steps", ignore_errors=True)  # one reset semantics everywhere: state + step scripts,
+    lock.unlink(missing_ok=True)                        # screenshots kept on purpose (audit evidence)
+    print("reset: state + step scripts cleared (screenshots kept for audit)")
     return 0
+
+
+def _parse_worker(stdout: str) -> dict:
+    lines = [l for l in stdout.splitlines() if l.startswith(RESULT_SENTINEL)]
+    if not lines:
+        raise RuntimeError(f"no sentinel line in worker output: {stdout[:300]!r}")
+    return json.loads(lines[-1][len(RESULT_SENTINEL):])
 
 
 def cmd_selftest() -> int:
@@ -303,7 +358,7 @@ todo.update(id="s1", status="claimed_verified")
         if p.returncode != 0 or not p.stdout.strip():
             raise RuntimeError(f"worker boot failed: rc={p.returncode} "
                                f"stdout={p.stdout[:300]!r} stderr={p.stderr[-800:]!r}")
-        r = json.loads(p.stdout.strip())
+        r = _parse_worker(p.stdout)
         assert r["ok"], r
         assert "hello 2" in r["stdout"] and "claimed_verified" in r["ledger"], r
         assert r["images"] and Path(r["images"][0]).exists(), r
@@ -313,20 +368,33 @@ todo.update(id="s1", status="claimed_verified")
         _spawn(bad, timeout=60)
         _spawn(bad, timeout=60)
         p2 = _spawn(bad, timeout=60)
-        r2 = json.loads(p2.stdout.strip())
+        r2 = _parse_worker(p2.stdout)
         assert not r2["ok"] and "STALL" in (r2.get("stall") or ""), r2
         # second concurrent worker must get BUSY, not corrupt shared state
         lock = GDIR / "state.lock"
         lock.write_text("0")  # fresh mtime: not stale, must be honored
         p3 = _spawn("print('blocked')", timeout=30)
-        r3 = json.loads(p3.stdout.strip())
+        r3 = _parse_worker(p3.stdout)
         assert not r3["ok"] and "BUSY" in r3["error"], r3
         lock.unlink()
         # corrupt state.json must self-heal, not brick the worker
         STATE.write_text("{corrupt", encoding="utf-8")
         s = _load()
         assert s["step_no"] == 0 and STATE.with_suffix(".json.bad").exists(), s
-        print("selftest OK: exec, screenshot, ps, todo state machine, stall guard, busy lock, corruption heal")
+        # sentinel protocol: raw fd-1 writes in model code must not lose a successful result
+        noisy = "import os\nos.write(1, b'raw-noise\\n')\nprint('after noise')"
+        p4 = _spawn(noisy, timeout=60)
+        line4 = [l for l in p4.stdout.splitlines() if l.startswith(RESULT_SENTINEL)]
+        assert line4 and json.loads(line4[-1][len(RESULT_SENTINEL):])["ok"], p4.stdout[-400:]
+        # identical SUCCEEDING steps: stall may fire STOP, but ok/exit must stay truthful
+        for _ in range(6):
+            last = _spawn("print('same')", timeout=60)
+        r5 = json.loads([l for l in last.stdout.splitlines() if l.startswith(RESULT_SENTINEL)][-1][len(RESULT_SENTINEL):])
+        assert r5["ok"] and "STALL STOP" in (r5.get("stall") or ""), r5
+        # stale-lock takeover needs BOTH age > 420s AND a dead pid
+        assert _pid_alive(os.getpid()) and not _pid_alive(999999), "pid liveness broken"
+        print("selftest OK: exec, screenshot, ps, todo state machine, stall guard, busy lock, corruption heal, "
+              "sentinel protocol, truthful stall exit, pid-aware lock")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return 0
@@ -340,7 +408,7 @@ def main() -> int:
             pass
     if len(sys.argv) >= 2 and sys.argv[1] == "--worker":
         code = sys.stdin.read()
-        print(json.dumps(worker(code), ensure_ascii=False))
+        print(RESULT_SENTINEL + json.dumps(worker(code), ensure_ascii=False))  # sentinel-prefixed: noise-proof line
         return 0
     cmd = sys.argv[1] if len(sys.argv) > 1 else "selftest"
     arg = sys.argv[2] if len(sys.argv) > 2 else ""

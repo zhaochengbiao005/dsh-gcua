@@ -34,7 +34,18 @@ function runEngine(args, root, signal, timeoutMs) {
   return new Promise((resolve) => {
     const child = spawn(PYTHON, [ENGINE, ...args], {
       cwd: root,
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8', GCUA_ROOT: root },
+      // Steps are process-isolated, not sandboxed — and that is still no reason to hand model code
+      // every host secret: only a minimal allowlist crosses into the engine (no API keys, no creds).
+      env: {
+        ...Object.fromEntries(
+          ['PATH', 'PATHEXT', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP',
+            'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS']
+            .filter((k) => process.env[k] !== undefined)
+            .map((k) => [k, process.env[k]]),
+        ),
+        PYTHONIOENCODING: 'utf-8',
+        GCUA_ROOT: root,
+      },
       windowsHide: true,
     });
     let out = '', err = '', done = false;
@@ -92,7 +103,7 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'gcua_step',
     description:
-      'Execute one GCUA step: run a batched Python macro-action in the sandbox (fresh process per step; files and applications persist, variables do not). ' +
+      'Execute one GCUA step: run a batched Python macro-action in a fresh isolated worker process (files and applications persist, variables do not). ' +
       'Available namespace: todo (Todo.update(id, kind, content, status) ledger), phase(name) mark workflow phase (plan/observe/verify/recovery…, execute→complete auto), screenshot() -> .gcua/shot-NNN.png, ps(cmd, timeout) powershell, paste_text(text) IME-proof clipboard typing, pyautogui, uia (pywinauto Desktop if installed), plus stdlib. ' +
       'Ledger and stall guard update automatically. Batch a whole macro-action (find -> act -> verify) into one step; poll Text-only at 0.3-0.5s; screenshot only at verdict.',
     parameters: {
@@ -170,7 +181,7 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'gcua_reset',
     description:
-      'Clear the GCUA ledger and stall history for the session working directory (start a new task).',
+      'Clear the GCUA ledger, stall history and step scripts for the session working directory (start a new task). Screenshots in .gcua/ are kept on purpose as audit evidence.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     output: {
       schema: { type: 'object' },
