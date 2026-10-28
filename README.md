@@ -31,7 +31,7 @@ Worker 命名空间（每步自动注入，无需 import）：
 - `pyautogui` / `uia`（pywinauto Desktop；未安装时首次访问抛 `ImportError` 并提示 `pip install pywinauto`，不是静默 `None`）/ 标准库
 - `phase(name)` — 步内相位标记（execute / observe / verify…），自动记录进轨迹
 
-内置防呆：**StallDetector**（失败步按同代码+同报错、成功步按同代码+同输出摘要指纹，连出 3 次警告、6 次熔断，窗口 12；熔断只提醒**绝不篡改**该步的真实成败）、**pid 感知文件锁**（接管需锁龄 >420s **且**持有进程已死，慢步骤永不被误判；BUSY 防并发）、**哨兵结果协议**（worker 结果行带 `__GCUA_RESULT__` 前缀，步骤代码往 fd-1 写原始字节也丢不了结果）、state.json 原子写 + 损坏自愈（隔离 `.json.bad`）、超时/中断 `taskkill /T /F` 斩杀整棵进程树、reset 语义三路统一（state + steps，截图留审计）、幂等 selftest 跑在临时目录。
+内置防呆：**StallDetector**（失败步按同代码+同报错、成功步按同代码+同输出摘要指纹，连出 3 次警告、6 次熔断，窗口 12；熔断只提醒**绝不篡改**该步的真实成败）、**pid 感知文件锁**（接管需锁龄 >420s **且**持有进程已死，慢步骤永不被误判；BUSY 防并发）、**哨兵结果协议**（worker 结果行带 `__GCUA_RESULT__` 前缀，步骤代码往 fd-1 写原始字节也丢不了结果）、state.json 原子写 + 损坏自愈（隔离 `.json.bad`）、超时/中断 `taskkill /T /F` 斩杀整棵进程树并把该步记为 `timeout_unknown`——超时步 ≠ 失败 ≠ 没跑过：点击/写入等副作用可能已落地，`gcua_status` 显式计数，先核再重试；steps 超 200 条截断时留 evicted 计数，历史裁剪不撒谎、reset 语义三路统一（state + steps，截图留审计）、幂等 selftest 跑在临时目录。
 
 ## 安装
 

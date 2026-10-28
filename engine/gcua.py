@@ -102,7 +102,7 @@ class Stall:
 
 # ---------- worker: build helper namespace, exec model code, report JSON ----------
 def _empty() -> dict:
-    return {"todo": {}, "todo_fp": "", "stall": [], "step_no": 0, "steps": []}
+    return {"todo": {}, "todo_fp": "", "stall": [], "step_no": 0, "steps": [], "steps_evicted": 0}
 
 
 def _load() -> dict:
@@ -123,11 +123,36 @@ def _save(s: dict) -> None:
     os.replace(tmp, STATE)  # atomic: a crash can never leave a half-written state.json
 
 
+def _cap_steps(s: dict) -> None:
+    steps = s.setdefault("steps", [])
+    if len(steps) > 200:
+        # dropped-with-a-receipt (upstream ActionRiskIndex.evicted): silent cap = lying about history
+        s["steps_evicted"] = s.get("steps_evicted", 0) + len(steps) - 200
+        del steps[:-200]
+
+
+def _kill_tree(pid: int) -> None:
+    # taskkill /T takes the whole tree; a bare kill() would orphan the step's powershell/python grandchildren
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+    else:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
 def _pid_alive(pid: int) -> bool:
     # a lock is only stealable when BOTH its age exceeded STALE_S AND its owner pid is dead:
     # a legit long GUI step (up to 6min) must never have its state stolen out from under it
     if pid <= 0:
         return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)  # liveness probe only: no signal is delivered
+            return True
+        except OSError:
+            return False
     try:
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
@@ -263,7 +288,7 @@ def worker(code: str) -> dict:
     rec["status"] = "completed" if rc == 0 else "failed"
     rec["elapsed_s"] = round(time.time() - t0, 1)
     s.setdefault("steps", []).append(rec)
-    s["steps"] = s["steps"][-200:]  # ponytail: cap in state; full replay = trajectory files later
+    _cap_steps(s)  # ponytail: cap in state; full replay = trajectory files later
     out = buf_out.getvalue()[-4000:]
     errbuf = (err + buf_err.getvalue())[-2000:]
     fp = Stall.fingerprint(code, rc, errbuf, out)
@@ -282,15 +307,49 @@ def worker(code: str) -> dict:
 def _spawn(code: str, timeout: int) -> subprocess.CompletedProcess:
     # worker stdout must be UTF-8: Windows pipes default to cp936 and JSON would mangle
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "GCUA_ROOT": str(ROOT)}
-    return subprocess.run([sys.executable, __file__, "--worker"], input=code,
-                          capture_output=True, text=True, encoding="utf-8",
-                          timeout=timeout, env=env)
+    proc = subprocess.Popen([sys.executable, __file__, "--worker"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", env=env)
+    try:
+        out, err = proc.communicate(code, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        _kill_tree(proc.pid)  # run()-style kill() only reaps the direct child; grandchildren keep running
+        out, err = proc.communicate()  # reap the corpse so no zombie/pipe survives
+        e.output, e.stderr, e.pid = out[-4000:], err[-1500:], proc.pid
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def cmd_step(path: str) -> int:
     code = Path(path).read_text(encoding="utf-8")
     GDIR.mkdir(parents=True, exist_ok=True)
-    p = _spawn(code, timeout=300)
+    timeout = max(1, int(os.environ.get("GCUA_STEP_TIMEOUT") or 300))  # override for tests/narrow boxes
+    try:
+        p = _spawn(code, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        # outcome_unknown (upstream action_journal semantics): killed-at-timeout is NOT "failed" and NOT
+        # "didn't run" - clicks/writes/subprocesses may have landed before the kill. No lock taken here:
+        # our worker is dead and its lock reaped below; a *different* live worker would only race the
+        # atomic save (last-writer-wins), never corrupt it.
+        lock = GDIR / "state.lock"
+        try:
+            if int(lock.read_text().strip()) == e.pid:
+                lock.unlink(missing_ok=True)  # hard-killed worker's atexit never ran; reap OUR lock only
+        except (OSError, ValueError):
+            pass
+        s = _load()
+        s["step_no"] = s.get("step_no", 0) + 1
+        s.setdefault("steps", []).append(
+            {"step": s["step_no"], "started": time.strftime("%H:%M:%S"),
+             "phases": [{"p": "execute", "at": 0.0}], "status": "timeout_unknown",
+             "elapsed_s": timeout, "partial_stdout": (e.output or "")[-1500:]})
+        _cap_steps(s)
+        _save(s)
+        print(json.dumps({"ok": False, "step": s["step_no"], "step_status": "timeout_unknown",
+                          "error": f"step killed at {timeout}s; outcome UNKNOWN - side effects may have "
+                                   f"landed; verify on-screen state before any retry",
+                          "stdout": (e.output or "")[-4000:]}, ensure_ascii=False))
+        return 1
     if p.returncode and not p.stdout.strip():
         print(json.dumps({"ok": False, "error": f"worker died rc={p.returncode}: {p.stderr[-800:]}"}))
         return 1
@@ -314,7 +373,9 @@ def cmd_status() -> int:
     for r in s.get("steps", [])[-3:]:
         print(f"step {r['step']:03d} [{'→'.join(p['p'] for p in r['phases'])}] "
               f"{r['status']} {r.get('elapsed_s', '?')}s")
-    print(f"stall history: {len(s.get('stall', []))} steps")
+    unknown = sum(1 for r in s.get("steps", []) if r.get("status") == "timeout_unknown")
+    print(f"stall history: {len(s.get('stall', []))} steps | timeout_unknown: {unknown} | "
+          f"steps evicted by cap: {s.get('steps_evicted', 0)}")
     return 0
 
 
@@ -393,8 +454,47 @@ todo.update(id="s1", status="claimed_verified")
         assert r5["ok"] and "STALL STOP" in (r5.get("stall") or ""), r5
         # stale-lock takeover needs BOTH age > 420s AND a dead pid
         assert _pid_alive(os.getpid()) and not _pid_alive(999999), "pid liveness broken"
+        # (a) timeout must kill the WHOLE tree, not just the worker: a spawned grandchild must die too
+        (tmp / "grand.py").write_text(
+            "import os, time\nopen(r'%s', 'w').write(str(os.getpid()))\ntime.sleep(60)\n" % (tmp / "grand.pid"),
+            encoding="utf-8")
+        (tmp / "slow.py").write_text(
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, r'%s'])\n"
+            "time.sleep(60)\n" % (tmp / "grand.py"),
+            encoding="utf-8")
+        try:
+            _spawn((tmp / "slow.py").read_text(encoding="utf-8"), timeout=10)
+            raise AssertionError("slow step did not time out")
+        except subprocess.TimeoutExpired as te:
+            assert isinstance(te.pid, int) and te.pid > 0, "killed pid not attached"
+            for _ in range(40):  # grandchild writes its pid within ~1s of start
+                if (tmp / "grand.pid").exists():
+                    break
+                time.sleep(0.25)
+            gpid = int((tmp / "grand.pid").read_text().strip())
+            for _ in range(20):  # taskkill needs a beat to land on the grandchild
+                if not _pid_alive(gpid):
+                    break
+                time.sleep(0.25)
+            assert not _pid_alive(gpid), f"grandchild {gpid} survived the tree kill"
+        (GDIR / "state.lock").unlink(missing_ok=True)  # direct _spawn kill leaves the leaked lock
+        # (b) cmd_step timeout: clean JSON, timeout_unknown bookkeeping, lock reaped, state recorded
+        os.environ["GCUA_STEP_TIMEOUT"] = "5"
+        try:
+            import contextlib
+            sbuf = io.StringIO()
+            with contextlib.redirect_stdout(sbuf):
+                rc_t = cmd_step(str(tmp / "slow.py"))
+        finally:
+            os.environ.pop("GCUA_STEP_TIMEOUT", None)
+        rt = json.loads(sbuf.getvalue().strip().splitlines()[-1])
+        assert rc_t == 1 and rt["step_status"] == "timeout_unknown" and "UNKNOWN" in rt["error"], rt
+        s_t = _load()
+        assert s_t["steps"][-1]["status"] == "timeout_unknown", s_t["steps"][-1]
+        assert not (GDIR / "state.lock").exists(), "killed worker's lock was not reaped"
         print("selftest OK: exec, screenshot, ps, todo state machine, stall guard, busy lock, corruption heal, "
-              "sentinel protocol, truthful stall exit, pid-aware lock")
+              "sentinel protocol, truthful stall exit, pid-aware lock, timeout outcome_unknown + tree kill")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return 0

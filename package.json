@@ -1,6 +1,6 @@
 {
   "name": "@local/gcua",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "GCUA agent state machine: process-isolated step execution, todo ledger, stall guard",
